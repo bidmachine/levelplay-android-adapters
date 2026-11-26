@@ -6,42 +6,80 @@ import com.ironsource.adapters.bidmachine.BidMachineAdapter
 import com.ironsource.adapters.bidmachine.BidMachineConstants
 import com.ironsource.mediationsdk.adunit.adapter.listener.RewardedVideoAdListener
 import com.ironsource.mediationsdk.adunit.adapter.utility.AdData
+import com.ironsource.mediationsdk.adunit.adapter.utility.AdapterErrorType
 import com.ironsource.mediationsdk.adunit.adapter.utility.AdapterErrors
 import com.ironsource.mediationsdk.bidding.BiddingDataCallback
 import com.ironsource.mediationsdk.logger.IronLog
 import com.ironsource.mediationsdk.model.NetworkSettings
 import com.unity3d.mediation.adapters.levelplay.LevelPlayBaseRewardedVideo
-import io.bidmachine.AdPlacementConfig
-import io.bidmachine.rewarded.RewardedAd
-import io.bidmachine.rewarded.RewardedRequest
+import io.bidmachine.Ad
+import io.bidmachine.AdLoadCallback
+import io.bidmachine.BMError
+import io.bidmachine.format.rewardedad.RewardedAd
 
 class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
     LevelPlayBaseRewardedVideo<BidMachineAdapter>(networkSettings) {
 
     private var rewardedAd: RewardedAd? = null
+    private var loadId = 0
 
     // region LevelPlay Rewarded Video API
 
+    @Synchronized
     override fun loadAd(
         adData: AdData,
         context: Context,
         listener: RewardedVideoAdListener
     ) {
+        destroyAd(adData)
+
+        val instance = BidMachineAdapter.bidMachineInstance
+        if (instance == null) {
+            listener.onAdLoadFailed(
+                AdapterErrorType.ADAPTER_ERROR_TYPE_INTERNAL,
+                BMError.NOT_INITIALIZED,
+                BidMachineConstants.SDK_NOT_INITIALIZED
+            )
+            return
+        }
+
         val placementId = adData.getString(BidMachineConstants.PLACEMENT_ID_KEY)
         IronLog.ADAPTER_API.verbose(BidMachineConstants.Logs.PLACEMENT_ID.format(placementId ?: ""))
 
-        rewardedAd = RewardedAd(context.applicationContext).apply {
-            setListener(BidMachineRewardedListener(listener))
+        val currentLoadId = loadId
+        val bidMachineListener = BidMachineRewardedListener(listener)
+        val loadCallback = object : AdLoadCallback<RewardedAd> {
+            override fun onAdLoaded(ad: RewardedAd) {
+                synchronized(this@BidMachineRewardedAdapter) {
+                    // A destroyed or replaced load must not retain an ad or notify LevelPlay.
+                    if (currentLoadId != loadId) {
+                        (ad as Ad).destroy()
+                        return
+                    }
+                    rewardedAd = ad
+                    ad.setListener(bidMachineListener)
+                    bidMachineListener.onAdLoaded(ad)
+                }
+            }
+
+            override fun onAdLoadFailed(bmError: BMError) {
+                synchronized(this@BidMachineRewardedAdapter) {
+                    if (currentLoadId == loadId) {
+                        bidMachineListener.onAdLoadFailed(bmError)
+                    }
+                }
+            }
         }
 
-        val adPlacementConfig = createRewardedPlacementConfig(placementId)
-        val rewardedRequest = RewardedRequest.Builder(adPlacementConfig)
-            .setBidPayload(adData.serverData)
-            .build()
-
-        rewardedAd?.load(rewardedRequest)
+        val bidResponse = adData.serverData
+        if (!bidResponse.isNullOrEmpty()) {
+            instance.loadRewarded(bidResponse, loadCallback)
+        } else {
+            instance.loadRewarded(BidMachineAdapter.createPlacement(placementId), loadCallback)
+        }
     }
 
+    @Synchronized
     override fun showAd(
         adData: AdData,
         activity: Activity,
@@ -61,16 +99,17 @@ class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
         rewardedAd?.show()
     }
 
+    @Synchronized
     override fun isAdAvailable(adData: AdData): Boolean {
-        return rewardedAd?.let { ad ->
-            ad.canShow() && !ad.isExpired
-        } ?: false
+        return (rewardedAd as Ad?)?.canShow() ?: false
     }
 
+    @Synchronized
     override fun destroyAd(adData: AdData) {
         IronLog.ADAPTER_API.verbose()
+        loadId++
         rewardedAd?.setListener(null)
-        rewardedAd?.destroy()
+        (rewardedAd as Ad?)?.destroy()
         rewardedAd = null
     }
 
@@ -89,20 +128,7 @@ class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
             return
         }
 
-        val adPlacementConfig = createRewardedPlacementConfig(placementId)
-        networkAdapter.collectBiddingData(context, biddingDataCallback, adPlacementConfig)
-    }
-
-    // endregion
-
-    // region Helper Methods
-
-    private fun createRewardedPlacementConfig(placementId: String?): AdPlacementConfig {
-        val adPlacementConfigBuilder = AdPlacementConfig.rewardedBuilder()
-        if (!placementId.isNullOrEmpty()) {
-            adPlacementConfigBuilder.withPlacementId(placementId)
-        }
-        return adPlacementConfigBuilder.build()
+        networkAdapter.collectBiddingData(biddingDataCallback, placementId)
     }
 
     // endregion

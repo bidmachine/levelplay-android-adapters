@@ -6,42 +6,80 @@ import com.ironsource.adapters.bidmachine.BidMachineAdapter
 import com.ironsource.adapters.bidmachine.BidMachineConstants
 import com.ironsource.mediationsdk.adunit.adapter.listener.InterstitialAdListener
 import com.ironsource.mediationsdk.adunit.adapter.utility.AdData
+import com.ironsource.mediationsdk.adunit.adapter.utility.AdapterErrorType
 import com.ironsource.mediationsdk.adunit.adapter.utility.AdapterErrors
 import com.ironsource.mediationsdk.bidding.BiddingDataCallback
 import com.ironsource.mediationsdk.logger.IronLog
 import com.ironsource.mediationsdk.model.NetworkSettings
 import com.unity3d.mediation.adapters.levelplay.LevelPlayBaseInterstitial
-import io.bidmachine.AdPlacementConfig
-import io.bidmachine.interstitial.InterstitialAd
-import io.bidmachine.interstitial.InterstitialRequest
+import io.bidmachine.Ad
+import io.bidmachine.AdLoadCallback
+import io.bidmachine.BMError
+import io.bidmachine.format.interstitialad.InterstitialAd
 
 class BidMachineInterstitialAdapter(networkSettings: NetworkSettings) :
     LevelPlayBaseInterstitial<BidMachineAdapter>(networkSettings) {
 
     private var interstitialAd: InterstitialAd? = null
+    private var loadId = 0
 
     // region LevelPlay Interstitial API
 
+    @Synchronized
     override fun loadAd(
         adData: AdData,
         context: Context,
         listener: InterstitialAdListener
     ) {
+        destroyAd(adData)
+
+        val instance = BidMachineAdapter.bidMachineInstance
+        if (instance == null) {
+            listener.onAdLoadFailed(
+                AdapterErrorType.ADAPTER_ERROR_TYPE_INTERNAL,
+                BMError.NOT_INITIALIZED,
+                BidMachineConstants.SDK_NOT_INITIALIZED
+            )
+            return
+        }
+
         val placementId = adData.getString(BidMachineConstants.PLACEMENT_ID_KEY)
         IronLog.ADAPTER_API.verbose(BidMachineConstants.Logs.PLACEMENT_ID.format(placementId ?: ""))
 
-        interstitialAd = InterstitialAd(context.applicationContext).apply {
-            setListener(BidMachineInterstitialListener(listener))
+        val currentLoadId = loadId
+        val bidMachineListener = BidMachineInterstitialListener(listener)
+        val loadCallback = object : AdLoadCallback<InterstitialAd> {
+            override fun onAdLoaded(ad: InterstitialAd) {
+                synchronized(this@BidMachineInterstitialAdapter) {
+                    // A destroyed or replaced load must not retain an ad or notify LevelPlay.
+                    if (currentLoadId != loadId) {
+                        (ad as Ad).destroy()
+                        return
+                    }
+                    interstitialAd = ad
+                    ad.setListener(bidMachineListener)
+                    bidMachineListener.onAdLoaded(ad)
+                }
+            }
+
+            override fun onAdLoadFailed(bmError: BMError) {
+                synchronized(this@BidMachineInterstitialAdapter) {
+                    if (currentLoadId == loadId) {
+                        bidMachineListener.onAdLoadFailed(bmError)
+                    }
+                }
+            }
         }
 
-        val adPlacementConfig = createInterstitialPlacementConfig(placementId)
-        val interstitialRequest = InterstitialRequest.Builder(adPlacementConfig)
-            .setBidPayload(adData.serverData)
-            .build()
-
-        interstitialAd?.load(interstitialRequest)
+        val bidResponse = adData.serverData
+        if (!bidResponse.isNullOrEmpty()) {
+            instance.loadInterstitial(bidResponse, loadCallback)
+        } else {
+            instance.loadInterstitial(BidMachineAdapter.createPlacement(placementId), loadCallback)
+        }
     }
 
+    @Synchronized
     override fun showAd(
         adData: AdData,
         activity: Activity,
@@ -61,16 +99,17 @@ class BidMachineInterstitialAdapter(networkSettings: NetworkSettings) :
         interstitialAd?.show()
     }
 
+    @Synchronized
     override fun isAdAvailable(adData: AdData): Boolean {
-        return interstitialAd?.let { ad ->
-            ad.canShow() && !ad.isExpired
-        } ?: false
+        return (interstitialAd as Ad?)?.canShow() ?: false
     }
 
+    @Synchronized
     override fun destroyAd(adData: AdData) {
         IronLog.ADAPTER_API.verbose()
+        loadId++
         interstitialAd?.setListener(null)
-        interstitialAd?.destroy()
+        (interstitialAd as Ad?)?.destroy()
         interstitialAd = null
     }
 
@@ -89,20 +128,7 @@ class BidMachineInterstitialAdapter(networkSettings: NetworkSettings) :
             return
         }
 
-        val adPlacementConfig = createInterstitialPlacementConfig(placementId)
-        networkAdapter.collectBiddingData(context, biddingDataCallback, adPlacementConfig)
-    }
-
-    // endregion
-
-    // region Helper Methods
-
-    private fun createInterstitialPlacementConfig(placementId: String?): AdPlacementConfig {
-        val adPlacementConfigBuilder = AdPlacementConfig.interstitialBuilder()
-        if (!placementId.isNullOrEmpty()) {
-            adPlacementConfigBuilder.withPlacementId(placementId)
-        }
-        return adPlacementConfigBuilder.build()
+        networkAdapter.collectBiddingData(biddingDataCallback, placementId)
     }
 
     // endregion
