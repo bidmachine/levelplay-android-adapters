@@ -25,13 +25,12 @@ class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
 
     // region LevelPlay Rewarded Video API
 
-    @Synchronized
     override fun loadAd(
         adData: AdData,
         context: Context,
         listener: RewardedVideoAdListener
     ) {
-        destroyAd(adData)
+        val currentLoadId = resetAd()
 
         val instance = BidMachineAdapter.bidMachineInstance
         if (instance == null) {
@@ -46,31 +45,42 @@ class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
         val placementId = adData.getString(BidMachineConstants.PLACEMENT_ID_KEY)
         IronLog.ADAPTER_API.verbose(BidMachineConstants.Logs.PLACEMENT_ID.format(placementId ?: ""))
 
-        val currentLoadId = loadId
         val bidMachineListener = BidMachineRewardedListener(listener)
         val loadCallback = object : AdLoadCallback<RewardedAd> {
             override fun onAdLoaded(ad: RewardedAd) {
-                synchronized(this@BidMachineRewardedAdapter) {
-                    // A destroyed or replaced load must not retain an ad or notify LevelPlay.
-                    if (currentLoadId != loadId) {
-                        (ad as Ad).destroy()
-                        return
+                ad.setListener(bidMachineListener)
+                val isCurrentLoad = synchronized(this@BidMachineRewardedAdapter) {
+                    if (currentLoadId == loadId) {
+                        rewardedAd = ad
+                        true
+                    } else {
+                        false
                     }
-                    rewardedAd = ad
-                    ad.setListener(bidMachineListener)
-                    bidMachineListener.onAdLoaded(ad)
                 }
+                // Discard results from a destroyed or replaced load.
+                if (!isCurrentLoad) {
+                    ad.setListener(null)
+                    (ad as Ad).destroy()
+                    return
+                }
+                bidMachineListener.onAdLoaded(ad)
             }
 
             override fun onAdLoadFailed(bmError: BMError) {
                 synchronized(this@BidMachineRewardedAdapter) {
-                    if (currentLoadId == loadId) {
-                        bidMachineListener.onAdLoadFailed(bmError)
+                    if (currentLoadId != loadId) {
+                        return
                     }
                 }
+                bidMachineListener.onAdLoadFailed(bmError)
             }
         }
 
+        synchronized(this) {
+            if (currentLoadId != loadId) {
+                return
+            }
+        }
         val bidResponse = adData.serverData
         if (!bidResponse.isNullOrEmpty()) {
             instance.loadRewarded(bidResponse, loadCallback)
@@ -79,7 +89,6 @@ class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
         }
     }
 
-    @Synchronized
     override fun showAd(
         adData: AdData,
         activity: Activity,
@@ -87,7 +96,8 @@ class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
     ) {
         IronLog.ADAPTER_API.verbose()
 
-        if (!isAdAvailable(adData)) {
+        val ad = synchronized(this) { rewardedAd }
+        if (ad == null || !(ad as Ad).canShow()) {
             IronLog.ADAPTER_API.error(BidMachineConstants.AD_NOT_READY)
             listener.onAdShowFailed(
                 AdapterErrors.ADAPTER_ERROR_AD_EXPIRED,
@@ -96,21 +106,16 @@ class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
             return
         }
 
-        rewardedAd?.show()
+        ad.show()
     }
 
-    @Synchronized
     override fun isAdAvailable(adData: AdData): Boolean {
-        return (rewardedAd as Ad?)?.canShow() ?: false
+        val ad = synchronized(this) { rewardedAd }
+        return (ad as Ad?)?.canShow() ?: false
     }
 
-    @Synchronized
     override fun destroyAd(adData: AdData) {
-        IronLog.ADAPTER_API.verbose()
-        loadId++
-        rewardedAd?.setListener(null)
-        (rewardedAd as Ad?)?.destroy()
-        rewardedAd = null
+        resetAd()
     }
 
     override fun collectBiddingData(
@@ -129,6 +134,25 @@ class BidMachineRewardedAdapter(networkSettings: NetworkSettings) :
         }
 
         networkAdapter.collectBiddingData(biddingDataCallback, placementId)
+    }
+
+    // endregion
+
+    // region Helper Methods
+
+    private fun resetAd(): Int {
+        IronLog.ADAPTER_API.verbose()
+        val ad: RewardedAd?
+        val currentLoadId: Int
+        synchronized(this) {
+            loadId++
+            currentLoadId = loadId
+            ad = rewardedAd
+            rewardedAd = null
+        }
+        ad?.setListener(null)
+        (ad as Ad?)?.destroy()
+        return currentLoadId
     }
 
     // endregion

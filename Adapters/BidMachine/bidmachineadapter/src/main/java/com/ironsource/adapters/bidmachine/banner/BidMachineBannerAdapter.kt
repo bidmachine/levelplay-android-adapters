@@ -30,14 +30,13 @@ class BidMachineBannerAdapter(networkSettings: NetworkSettings) :
 
     // region LevelPlay Banner API
 
-    @Synchronized
     override fun loadAd(
         adData: AdData,
         activity: Activity,
         bannerSize: ISBannerSize,
         listener: BannerAdListener
     ) {
-        destroyAd(adData)
+        val currentLoadId = resetAd()
 
         val instance = BidMachineAdapter.bidMachineInstance
         if (instance == null) {
@@ -64,28 +63,34 @@ class BidMachineBannerAdapter(networkSettings: NetworkSettings) :
             return
         }
 
-        val currentLoadId = loadId
         val bidMachineListener = BidMachineBannerListener(listener)
         val loadCallback = object : AdLoadCallback<BannerView> {
             override fun onAdLoaded(ad: BannerView) {
-                synchronized(this@BidMachineBannerAdapter) {
-                    // A destroyed or replaced load must not retain an ad or notify LevelPlay.
-                    if (currentLoadId != loadId) {
-                        ad.destroy()
-                        return
+                ad.setListener(bidMachineListener)
+                val isCurrentLoad = synchronized(this@BidMachineBannerAdapter) {
+                    if (currentLoadId == loadId) {
+                        bannerAdView = ad
+                        true
+                    } else {
+                        false
                     }
-                    bannerAdView = ad
-                    ad.setListener(bidMachineListener)
-                    bidMachineListener.onAdLoaded(ad)
                 }
+                // Discard results from a destroyed or replaced load.
+                if (!isCurrentLoad) {
+                    ad.setListener(null)
+                    ad.destroy()
+                    return
+                }
+                bidMachineListener.onAdLoaded(ad)
             }
 
             override fun onAdLoadFailed(bmError: BMError) {
                 synchronized(this@BidMachineBannerAdapter) {
-                    if (currentLoadId == loadId) {
-                        bidMachineListener.onAdLoadFailed(bmError)
+                    if (currentLoadId != loadId) {
+                        return
                     }
                 }
+                bidMachineListener.onAdLoadFailed(bmError)
             }
         }
 
@@ -95,29 +100,21 @@ class BidMachineBannerAdapter(networkSettings: NetworkSettings) :
                 if (currentLoadId != loadId) {
                     return@post
                 }
-                if (!bidResponse.isNullOrEmpty()) {
-                    instance.loadBanner(bidResponse, bidMachineBannerSize, loadCallback)
-                } else {
-                    instance.loadBanner(
-                        BidMachineAdapter.createPlacement(placementId),
-                        bidMachineBannerSize,
-                        loadCallback
-                    )
-                }
+            }
+            if (!bidResponse.isNullOrEmpty()) {
+                instance.loadBanner(bidResponse, bidMachineBannerSize, loadCallback)
+            } else {
+                instance.loadBanner(
+                    BidMachineAdapter.createPlacement(placementId),
+                    bidMachineBannerSize,
+                    loadCallback
+                )
             }
         }
     }
 
-    @Synchronized
     override fun destroyAd(adData: AdData) {
-        IronLog.ADAPTER_API.verbose()
-        loadId++
-        val ad = bannerAdView
-        bannerAdView = null
-        ad?.setListener(null)
-        mainHandler.post {
-            ad?.destroy()
-        }
+        resetAd()
     }
 
     override fun collectBiddingData(
@@ -155,11 +152,29 @@ class BidMachineBannerAdapter(networkSettings: NetworkSettings) :
 
     // region Helper Methods
 
+    private fun resetAd(): Int {
+        IronLog.ADAPTER_API.verbose()
+        val ad: BannerView?
+        val currentLoadId: Int
+        synchronized(this) {
+            loadId++
+            currentLoadId = loadId
+            ad = bannerAdView
+            bannerAdView = null
+        }
+        ad?.setListener(null)
+        mainHandler.post {
+            ad?.destroy()
+        }
+        return currentLoadId
+    }
+
     private fun getBannerSize(bannerSize: ISBannerSize, context: Context): BannerAdSize? {
         if (bannerSize.isAdaptive) {
-            val width = bannerSize.toLevelPlayAdSize(context)?.getWidth() ?: 0
+            val adSize = bannerSize.toLevelPlayAdSize(context)
+            val width = adSize?.getWidth() ?: 0
             if (width > 0) {
-                return BannerAdSize.adaptive(width, 0)
+                return BannerAdSize.adaptive(width, (adSize?.getHeight() ?: 0).coerceAtLeast(0))
             }
         }
 
